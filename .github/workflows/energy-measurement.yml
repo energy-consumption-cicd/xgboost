@@ -1,0 +1,450 @@
+name: Energy Measurement
+run-name: Energy measurement (${{ inputs.campaign }})
+
+# Invokes run_pipeline.sh on a self-hosted runner; the original CI workflows are untouched.
+
+on:
+  workflow_dispatch:
+    inputs:
+      campaign:
+        description: "validation = run 0 only (smoke test) | full = warm-up + runs 1..10 + median"
+        type: choice
+        required: true
+        default: validation
+        options:
+          - validation
+          - full
+
+jobs:
+  measure:
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 1200
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Make RAPL counters readable
+        run: sudo /usr/local/bin/rapl-set-readable
+
+      - name: Check RAPL availability
+        run: |
+          if [ ! -d /sys/class/powercap/intel-rapl ]; then
+            echo "RAPL not available on this runner"
+            exit 1
+          fi
+          echo "Available RAPL domains:"
+          ls /sys/class/powercap/intel-rapl/
+
+      - name: Check Docker image
+        run: |
+          if ! docker image inspect xgboost-medicao &>/dev/null; then
+            echo "Image 'xgboost-medicao' not found on the runner."
+            echo "Build it manually before dispatching this workflow:"
+            echo "  docker build -t xgboost-medicao -f energy-measurement/Dockerfile energy-measurement"
+            exit 1
+          fi
+          echo "Docker image found."
+          docker image inspect xgboost-medicao --format '{{.Created}}'
+
+      - name: Validation run (run 0)
+        if: ${{ inputs.campaign == 'validation' }}
+        run: |
+          RESULTS_DIR="$HOME/experimentos/medicao/resultados/xgboost/runs"
+
+          validate_csv() {
+            local csv="$1"
+            [ -f "$csv" ] || return 1
+            awk -F, '
+              NR==1 { next }
+              $2=="build"||$2=="test"||$2=="total" {
+                seen[$2]=1
+                if ($3==""||$4==""||$7=="" || $3+0<=0 || $4+0<=0 || $7+0<=0) inval[$2]=1
+              }
+              END {
+                split("build test total", req, " ")
+                for (i in req) {
+                  s=req[i]
+                  if (!(s in seen)) exit 1
+                  if (s in inval)   exit 1
+                }
+                exit 0
+              }
+            ' "$csv"
+          }
+
+          # Pre-registered: build 0, test 1 (two float32 tests that fail on the bench CPU); the pipeline exit is the test exit.
+          EXPECTED_EXIT_PIPELINE=1
+          PIPELINE_EXIT=0
+          bash "$HOME/experimentos/medicao/repositorios/xgboost/run_pipeline.sh" 0 \
+            || PIPELINE_EXIT=$?
+          if [ "$PIPELINE_EXIT" -eq 90 ]; then
+            echo "::error title=Baseline gate::run 0 not started: idle package rate above the pre-registered 1.0 W. See runs/discarded_baseline_run_00.txt"
+            mkdir -p "$RESULTS_DIR/validation"
+            mv -f "$RESULTS_DIR/discarded_baseline_run_00.txt" "$RESULTS_DIR/validation/" 2>/dev/null || true
+            exit 1
+          fi
+          if [ "$PIPELINE_EXIT" -eq 91 ]; then
+            echo "::error title=Stage ceiling::run 0 aborted: a stage exceeded its pre-registered ceiling. See runs/discarded_timeout_run_00.txt"
+            mkdir -p "$RESULTS_DIR/validation"
+            mv -f "$RESULTS_DIR/discarded_timeout_run_00.txt" "$RESULTS_DIR/validation/" 2>/dev/null || true
+            exit 1
+          fi
+          if [ "$PIPELINE_EXIT" -eq 92 ]; then
+            echo "::error title=Network check::run 0 not started: --network none failed the hermeticity check. See runs/discarded_network_run_00.txt"
+            mkdir -p "$RESULTS_DIR/validation"
+            mv -f "$RESULTS_DIR/discarded_network_run_00.txt" "$RESULTS_DIR/validation/" 2>/dev/null || true
+            mv -f "$RESULTS_DIR/network_check_run_00.txt" "$RESULTS_DIR/validation/" 2>/dev/null || true
+            exit 1
+          fi
+
+          # Run 0 is a smoke test; keep it out of the median aggregation glob.
+          mkdir -p "$RESULTS_DIR/validation"
+          if [ -f "$RESULTS_DIR/run_00.csv" ]; then
+            mv -f "$RESULTS_DIR/run_00.csv" "$RESULTS_DIR/validation/run_00.csv"
+            echo "run_00.csv moved to runs/validation/ (excluded from results)"
+          fi
+          for side in exit_codes_run_00.txt artifact_check_run_00.txt rapl_domains_run_00.txt network_check_run_00.txt gtest_run_00_test.xml sccache_stats_run_00_build.txt route_run_00_test.txt memory_peak_run_00_build.txt memory_peak_run_00_test.txt memory_events_run_00_build.txt memory_events_run_00_test.txt; do
+            if [ -f "$RESULTS_DIR/$side" ]; then
+              mv -f "$RESULTS_DIR/$side" "$RESULTS_DIR/validation/$side"
+              echo "$side moved along (CSV+sidecar set preserved)"
+            fi
+          done
+
+          if ! validate_csv "$RESULTS_DIR/validation/run_00.csv"; then
+            echo "::error title=Measurement failure::run 0: CSV missing or invalid at runs/validation/run_00.csv (pipeline exit=$PIPELINE_EXIT)"
+            exit 1
+          fi
+          if [ "$PIPELINE_EXIT" -ne "$EXPECTED_EXIT_PIPELINE" ]; then
+            echo "::warning title=Unexpected exit code::run 0: run_pipeline.sh exited $PIPELINE_EXIT; pre-registered $EXPECTED_EXIT_PIPELINE - review the stage logs before the campaign"
+          fi
+          if ! grep -q '^verdict,conform$' "$RESULTS_DIR/validation/artifact_check_run_00.txt" 2>/dev/null; then
+            echo "::warning title=Artifact check failed::run 0: the per-stage exits, the gtest case set or the memory events did not meet the pre-registered criterion; see runs/validation/artifact_check_run_00.txt - review before the campaign"
+          fi
+          echo "run 0: valid measurement (workload exit=$PIPELINE_EXIT, pre-registered $EXPECTED_EXIT_PIPELINE)"
+
+          awk -F, '
+            NR==1 { next }
+            ($2=="build"||$2=="test") && $7+0 > 0 {
+              r = ($8 + $9) / $7
+              if (r < 0.5)
+                printf "::warning::[run 0] stage %s: (user+sys)/wall = %.4f < 0.5 (user=%ss sys=%ss wall=%ss) - user/sys capture may have regressed to the host\n", $2, r, $8, $9, $7
+            }
+          ' "$RESULTS_DIR/validation/run_00.csv"
+
+      - name: Run 10 measurement runs
+        if: ${{ inputs.campaign == 'full' }}
+        run: |
+          RESULTS_DIR="$HOME/experimentos/medicao/resultados/xgboost/runs"
+          PIPELINE="$HOME/experimentos/medicao/repositorios/xgboost/run_pipeline.sh"
+          # Pre-registered pipeline exit: 0 (see commands.sh and artifact_check_run_NN.txt).
+          EXPECTED_EXIT_PIPELINE=0
+
+          # A campaign is one session under one set of bench conditions.
+          EXISTING=""
+          for f in "$RESULTS_DIR"/run_[0-9][0-9].csv; do
+            [ -f "$f" ] || continue
+            NN=$(basename "$f" .csv); NN=${NN#run_}
+            [ "$NN" = "00" ] && continue
+            EXISTING="${EXISTING:+$EXISTING }$NN"
+          done
+          if [ -n "$EXISTING" ]; then
+            echo "::error title=Results directory not empty::run CSV(s) already present: $EXISTING. A campaign is a single continuous session - every run must come from the same bench conditions, so no pre-existing result is ever reused. Archive the previous results under runs/discarded_<reason>_<date>/ and dispatch again."
+            echo "- **Campaign refused** - pre-existing run CSV(s): $EXISTING. Archive them before dispatching." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # Ensure no validation run_00.csv pollutes the median.
+          rm -f "$RESULTS_DIR/run_00.csv"
+
+          ORDER="$RESULTS_DIR/execution_order.txt"
+          if [ ! -f "$ORDER" ]; then
+            echo "# actual execution order (append-only) - run,start_utc,end_utc,exit,origin; exits 90 (baseline gate) and 91 (stage ceiling) are bench/protocol, not workload" > "$ORDER"
+          fi
+          now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+          # user/sys are diagnostic columns and are not validated.
+          validate_csv() {
+            local csv="$1"
+            [ -f "$csv" ] || return 1
+            awk -F, '
+              NR==1 { next }
+              $2=="build"||$2=="test"||$2=="total" {
+                seen[$2]=1
+                if ($3==""||$4==""||$7=="" || $3+0<=0 || $4+0<=0 || $7+0<=0) inval[$2]=1
+              }
+              END {
+                split("build test total", req, " ")
+                for (i in req) {
+                  s=req[i]
+                  if (!(s in seen)) exit 1
+                  if (s in inval)   exit 1
+                }
+                exit 0
+              }
+            ' "$csv"
+          }
+
+          # Conformity of per-stage exits, gtest case set and memory events, written by run_pipeline.sh.
+          artifact_conform() {
+            grep -q '^verdict,conform$' "$1" 2>/dev/null
+          }
+
+          # Below 0.5, user/sys captured the host docker client; not a reason to invalidate.
+          warn_user_sys() {
+            local csv="$1" origin="$2"
+            [ -f "$csv" ] || return 0
+            awk -F, -v origin="$origin" '
+              NR==1 { next }
+              ($2=="build"||$2=="test") && $7+0 > 0 {
+                r = ($8 + $9) / $7
+                if (r < 0.5)
+                  printf "::warning::[%s] stage %s: (user+sys)/wall = %.4f < 0.5 (user=%ss sys=%ss wall=%ss) - user/sys capture may have regressed to the host\n", origin, $2, r, $8, $9, $7
+              }
+            ' "$csv" | tee -a "$GITHUB_STEP_SUMMARY"
+            return 0
+          }
+
+          # A run without a valid CSV is substituted, not fatal; the warm-up counts too.
+          MAX_VALID=10
+          MAX_SUBSTITUTIONS=2
+          VALID_RUNS=""
+          VALID_COUNT=0
+          SUBSTITUTIONS=0
+          SUBSTITUTION_REASONS=""
+
+          # 11 runs, median over 10: the warm-up settles the page cache of the image layers.
+          mkdir -p "$RESULTS_DIR/warmup"
+          WARMUP_DONE=0
+          WARMUP_ATTEMPT=0
+          while [ "$WARMUP_DONE" -eq 0 ]; do
+            WARMUP_ATTEMPT=$((WARMUP_ATTEMPT + 1))
+            echo "::group::Warm-up attempt $WARMUP_ATTEMPT (discarded from analysis)"
+            WARMUP_EXIT=0
+            T_INI=$(now_utc)
+            bash "$PIPELINE" 0 || WARMUP_EXIT=$?
+            echo "00,$T_INI,$(now_utc),$WARMUP_EXIT,warmup" >> "$ORDER"
+            REASON=""
+            if [ "$WARMUP_EXIT" -eq 90 ]; then
+              REASON="baseline gate (exit 90), see runs/warmup/discarded_baseline_run_warmup_${WARMUP_ATTEMPT}.txt"
+              mv -f "$RESULTS_DIR/discarded_baseline_run_00.txt" "$RESULTS_DIR/warmup/discarded_baseline_run_warmup_${WARMUP_ATTEMPT}.txt" 2>/dev/null || true
+            elif [ "$WARMUP_EXIT" -eq 91 ]; then
+              REASON="stage ceiling (exit 91), see runs/warmup/discarded_timeout_run_warmup_${WARMUP_ATTEMPT}.txt"
+              mv -f "$RESULTS_DIR/discarded_timeout_run_00.txt" "$RESULTS_DIR/warmup/discarded_timeout_run_warmup_${WARMUP_ATTEMPT}.txt" 2>/dev/null || true
+              mv -f "$RESULTS_DIR/exit_codes_run_00.txt" "$RESULTS_DIR/warmup/exit_codes_run_warmup_${WARMUP_ATTEMPT}_discarded.txt" 2>/dev/null || true
+            elif [ "$WARMUP_EXIT" -eq 92 ]; then
+              REASON="network check (exit 92), see runs/warmup/discarded_network_run_warmup_${WARMUP_ATTEMPT}.txt"
+              mv -f "$RESULTS_DIR/discarded_network_run_00.txt" "$RESULTS_DIR/warmup/discarded_network_run_warmup_${WARMUP_ATTEMPT}.txt" 2>/dev/null || true
+              mv -f "$RESULTS_DIR/network_check_run_00.txt" "$RESULTS_DIR/warmup/network_check_run_warmup_${WARMUP_ATTEMPT}_discarded.txt" 2>/dev/null || true
+            elif [ ! -f "$RESULTS_DIR/run_00.csv" ]; then
+              REASON="missing CSV (pipeline exit $WARMUP_EXIT), see runs/warmup/discarded_invalid_run_warmup_${WARMUP_ATTEMPT}.txt"
+              printf 'run,00\nattempt,%s\ntimestamp_utc,%s\npipeline_exit,%s\nreason,run_00.csv not written\n' "$WARMUP_ATTEMPT" "$(now_utc)" "$WARMUP_EXIT" > "$RESULTS_DIR/warmup/discarded_invalid_run_warmup_${WARMUP_ATTEMPT}.txt"
+            fi
+            if [ -n "$REASON" ]; then
+              SUBSTITUTIONS=$((SUBSTITUTIONS + 1))
+              SUBSTITUTION_REASONS="${SUBSTITUTION_REASONS:+$SUBSTITUTION_REASONS; }warm-up attempt $WARMUP_ATTEMPT: $REASON"
+              if [ "$SUBSTITUTIONS" -gt "$MAX_SUBSTITUTIONS" ]; then
+                echo "::error title=Campaign invalid::warm-up attempt $WARMUP_ATTEMPT discarded ($REASON) - substitution $SUBSTITUTIONS exceeds the pre-registered limit of $MAX_SUBSTITUTIONS. Campaign ended as INVALID. Reasons: $SUBSTITUTION_REASONS"
+                echo "- **Campaign INVALID** - $SUBSTITUTIONS substitutions exceed the limit of $MAX_SUBSTITUTIONS before any valid run. Reasons: $SUBSTITUTION_REASONS" >> "$GITHUB_STEP_SUMMARY"
+                echo "::endgroup::"
+                exit 1
+              fi
+              echo "::warning title=Warm-up substituted::warm-up attempt $WARMUP_ATTEMPT discarded ($REASON) - substitution $SUBSTITUTIONS of $MAX_SUBSTITUTIONS; the warm-up is repeated"
+              echo "- Warm-up attempt $WARMUP_ATTEMPT: **DISCARDED** ($REASON) - substitution $SUBSTITUTIONS of $MAX_SUBSTITUTIONS" >> "$GITHUB_STEP_SUMMARY"
+              echo "::endgroup::"
+              echo "Rest before the substitute warm-up (120s)..."
+              sleep 120
+              continue
+            fi
+            WARMUP_DONE=1
+            mv -f "$RESULTS_DIR/run_00.csv" "$RESULTS_DIR/warmup/run_warmup.csv"
+            for side in exit_codes artifact_check rapl_domains network_check; do
+              if [ -f "$RESULTS_DIR/${side}_run_00.txt" ]; then
+                mv -f "$RESULTS_DIR/${side}_run_00.txt" "$RESULTS_DIR/warmup/${side}_run_warmup.txt"
+              fi
+            done
+            for st in build test; do
+              for side in gtest:xml sccache_stats:txt route:txt memory_peak:txt memory_events:txt; do
+                if [ -f "$RESULTS_DIR/${side%%:*}_run_00_${st}.${side#*:}" ]; then
+                  mv -f "$RESULTS_DIR/${side%%:*}_run_00_${st}.${side#*:}" "$RESULTS_DIR/warmup/${side%%:*}_run_warmup_${st}.${side#*:}"
+                fi
+              done
+            done
+            if [ "$WARMUP_EXIT" -ne "$EXPECTED_EXIT_PIPELINE" ]; then
+              echo "::warning title=Unexpected exit code::warm-up: run_pipeline.sh exited $WARMUP_EXIT; pre-registered $EXPECTED_EXIT_PIPELINE. Warm-up is discarded data; the campaign continues"
+            fi
+            if ! artifact_conform "$RESULTS_DIR/warmup/artifact_check_run_warmup.txt"; then
+              echo "::warning title=Artifact check failed::warm-up: the per-stage exits, the gtest case set or the memory events did not meet the pre-registered criterion; see runs/warmup/artifact_check_run_warmup.txt. Warm-up is discarded data; the campaign continues"
+            fi
+            warn_user_sys "$RESULTS_DIR/warmup/run_warmup.csv" "warm-up"
+            {
+              echo "## Warm-up executed and DISCARDED (not in the median)"
+              echo "- CSV at \`runs/warmup/run_warmup.csv\` (overwritten each session)"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+          done
+          echo "Post-warm-up rest (120s)..."
+          sleep 120
+
+          # The campaign ends at 10 valid runs or at the third substitution.
+          echo "## Execution (full mode) - every run executed in this session" >> "$GITHUB_STEP_SUMMARY"
+          i=0
+          while [ "$VALID_COUNT" -lt "$MAX_VALID" ]; do
+            i=$((i + 1))
+            NN=$(printf '%02d' "$i")
+            CSV="$RESULTS_DIR/run_${NN}.csv"
+            echo "::group::Run $NN (valid so far: $VALID_COUNT of $MAX_VALID, substitutions: $SUBSTITUTIONS of $MAX_SUBSTITUTIONS)"
+            echo "Run $NN - executing"
+            RUN_EXIT=0
+            T_INI=$(now_utc)
+            bash "$PIPELINE" "$i" || RUN_EXIT=$?
+            echo "$NN,$T_INI,$(now_utc),$RUN_EXIT,campaign" >> "$ORDER"
+
+            REASON=""
+            if [ "$RUN_EXIT" -eq 90 ]; then
+              REASON="baseline gate (exit 90), see runs/discarded_baseline_run_${NN}.txt"
+            elif [ "$RUN_EXIT" -eq 91 ]; then
+              REASON="stage ceiling (exit 91), see runs/discarded_timeout_run_${NN}.txt"
+            elif [ "$RUN_EXIT" -eq 92 ]; then
+              REASON="network check (exit 92), see runs/discarded_network_run_${NN}.txt"
+            elif ! validate_csv "$CSV"; then
+              REASON="missing or invalid CSV (pipeline exit $RUN_EXIT), see runs/discarded_invalid_run_${NN}.txt"
+              {
+                echo "run,$NN"
+                echo "timestamp_utc,$(now_utc)"
+                echo "pipeline_exit,$RUN_EXIT"
+                echo "csv_present,$([ -f "$CSV" ] && echo yes || echo no)"
+                echo "reason,CSV missing or invalid (build, test and total rows with positive energy_pkg_j, energy_cores_j, wall_time_s required)"
+              } > "$RESULTS_DIR/discarded_invalid_run_${NN}.txt"
+            elif ! artifact_conform "$RESULTS_DIR/artifact_check_run_${NN}.txt"; then
+              REASON="artifact check failed (per-stage exits, gtest case set and no OOM kill required), see runs/discarded_nonconform_run_${NN}.txt"
+              {
+                echo "run,$NN"
+                echo "timestamp_utc,$(now_utc)"
+                echo "pipeline_exit,$RUN_EXIT"
+                echo "reason,per-stage exits, gtest case set or memory events failed the pre-registered artifact check; exit code unchanged"
+                cat "$RESULTS_DIR/artifact_check_run_${NN}.txt" 2>/dev/null || echo "artifact_check,missing"
+              } > "$RESULTS_DIR/discarded_nonconform_run_${NN}.txt"
+            fi
+
+            if [ -n "$REASON" ]; then
+              # A discarded CSV must not reach the median glob; kept for audit.
+              if [ -f "$CSV" ]; then
+                mkdir -p "$RESULTS_DIR/invalid"
+                mv -f "$CSV" "$RESULTS_DIR/invalid/run_${NN}.csv"
+                for side in exit_codes artifact_check rapl_domains network_check; do
+                  [ -f "$RESULTS_DIR/${side}_run_${NN}.txt" ] && mv -f "$RESULTS_DIR/${side}_run_${NN}.txt" "$RESULTS_DIR/invalid/"
+                done
+                for side in "$RESULTS_DIR"/gtest_run_"${NN}"_*.xml "$RESULTS_DIR"/sccache_stats_run_"${NN}"_*.txt "$RESULTS_DIR"/route_run_"${NN}"_*.txt "$RESULTS_DIR"/memory_peak_run_"${NN}"_*.txt "$RESULTS_DIR"/memory_events_run_"${NN}"_*.txt; do
+                  [ -f "$side" ] && mv -f "$side" "$RESULTS_DIR/invalid/"
+                done
+              fi
+              SUBSTITUTIONS=$((SUBSTITUTIONS + 1))
+              SUBSTITUTION_REASONS="${SUBSTITUTION_REASONS:+$SUBSTITUTION_REASONS; }run $NN: $REASON"
+              if [ "$SUBSTITUTIONS" -gt "$MAX_SUBSTITUTIONS" ]; then
+                echo "::error title=Campaign invalid::run $NN discarded ($REASON) - substitution $SUBSTITUTIONS exceeds the pre-registered limit of $MAX_SUBSTITUTIONS. Campaign ended as INVALID with $VALID_COUNT valid runs. Reasons: $SUBSTITUTION_REASONS"
+                echo "- Run $NN: **DISCARDED** ($REASON)" >> "$GITHUB_STEP_SUMMARY"
+                echo "- **Campaign INVALID** - $SUBSTITUTIONS substitutions exceed the limit of $MAX_SUBSTITUTIONS; $VALID_COUNT valid runs. Reasons: $SUBSTITUTION_REASONS" >> "$GITHUB_STEP_SUMMARY"
+                echo "::endgroup::"
+                exit 1
+              fi
+              echo "::warning title=Run substituted::run $NN discarded ($REASON) - substitution $SUBSTITUTIONS of $MAX_SUBSTITUTIONS; the campaign continues with run $(printf '%02d' $((i + 1)))"
+              echo "- Run $NN: **DISCARDED** ($REASON) - substitution $SUBSTITUTIONS of $MAX_SUBSTITUTIONS" >> "$GITHUB_STEP_SUMMARY"
+              echo "::endgroup::"
+              echo "Rest before the substitute run (120s)..."
+              sleep 120
+              continue
+            fi
+
+            VALID_RUNS="${VALID_RUNS:+$VALID_RUNS }$NN"
+            VALID_COUNT=$((VALID_COUNT + 1))
+            echo "- Run $NN: **executed** (valid $VALID_COUNT of $MAX_VALID)" >> "$GITHUB_STEP_SUMMARY"
+            warn_user_sys "$CSV" "run $NN"
+            if [ "$RUN_EXIT" -ne "$EXPECTED_EXIT_PIPELINE" ]; then
+              echo "::warning title=Unexpected exit code::run $NN: run_pipeline.sh exited $RUN_EXIT; pre-registered $EXPECTED_EXIT_PIPELINE. Run to REJECT per the declared exit-code list; CSV preserved"
+              echo "- Run $NN: workload exit=$RUN_EXIT - **outside the declared list ($EXPECTED_EXIT_PIPELINE)**. Run to REJECT per the declared exit-code list; CSV preserved" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "::endgroup::"
+            if [ "$VALID_COUNT" -lt "$MAX_VALID" ]; then
+              echo "Rest between runs (120s)..."
+              sleep 120
+            fi
+          done
+
+          echo "## Substitutions: $SUBSTITUTIONS of $MAX_SUBSTITUTIONS${SUBSTITUTION_REASONS:+ - $SUBSTITUTION_REASONS}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Valid runs: $VALID_RUNS (substitutions: $SUBSTITUTIONS)"
+
+          # Final sweep: re-emits every warning of the session as one block for review.
+          for NN in $VALID_RUNS; do
+            warn_user_sys "$RESULTS_DIR/run_${NN}.csv" "run $NN"
+          done
+
+          INVALID=""
+          for NN in $VALID_RUNS; do
+            validate_csv "$RESULTS_DIR/run_${NN}.csv" || INVALID="${INVALID:+$INVALID }$NN"
+          done
+          N_CSV=$(ls "$RESULTS_DIR"/run_[0-9][0-9].csv 2>/dev/null | wc -l)
+          if [ -n "$INVALID" ] || [ "$VALID_COUNT" -ne "$MAX_VALID" ] || [ "$N_CSV" -ne "$MAX_VALID" ]; then
+            echo "::error title=Incomplete campaign::valid runs: $VALID_COUNT of $MAX_VALID; CSVs in runs/: $N_CSV; invalid: ${INVALID:-none} - medians will NOT be computed"
+            echo "- **Incomplete campaign** - valid runs $VALID_COUNT of $MAX_VALID, CSVs $N_CSV, invalid: ${INVALID:-none}" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "$MAX_VALID runs with valid CSVs ($VALID_RUNS) - aggregate.py precondition satisfied"
+
+      - name: Aggregate medians
+        if: ${{ inputs.campaign == 'full' }}
+        run: |
+          RESULTS_DIR="$HOME/experimentos/medicao/resultados/xgboost/runs"
+          SUMMARY="$HOME/experimentos/medicao/resultados/xgboost/summary.csv"
+          python3 "$HOME/experimentos/medicao/scripts/aggregate.py" "$RESULTS_DIR" "$SUMMARY"
+          {
+            echo ""
+            echo "## Medians (10 runs) - xgboost"
+            echo '```'
+            cat "$SUMMARY"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # --privileged writes as root in the workspace; a disposable container fixes ownership.
+      - name: Fix workspace permissions
+        if: always()
+        run: |
+          docker run --rm --privileged \
+            -v "${{ github.workspace }}":/w \
+            alpine chown -R "$(id -u):$(id -g)" /w || true
+
+      # Relative tree with no host path or user name; gtest.xml, the sccache statistics, the route and the memory files back the conformity verdicts.
+      - name: Stage artifact
+        if: always()
+        run: |
+          SRC="$HOME/experimentos/medicao/resultados/xgboost"
+          DST="${{ github.workspace }}/artifact"
+          rm -rf "$DST"
+          mkdir -p "$DST/runs" "$DST/logs"
+          [ -f "$SRC/summary.csv" ] && cp "$SRC/summary.csv" "$DST/" || true
+          if [ -d "$SRC/runs" ]; then
+            ( cd "$SRC/runs" && find . \
+                \( -name 'run_*.csv' -o -name 'exit_codes_run_*.txt' -o -name 'artifact_check_run_*.txt' -o -name 'network_check_run_*.txt' -o -name 'gtest_run_*.xml' -o -name 'sccache_stats_run_*.txt' -o -name 'route_run_*.txt' -o -name 'memory_peak_run_*.txt' -o -name 'memory_events_run_*.txt' -o -name 'execution_order.txt' -o -name 'discarded_*_run_*.txt' -o -name 'rapl_domains_run_*.txt' \) \
+                -exec cp --parents {} "$DST/runs/" \; ) || true
+          fi
+          if [ -d "$SRC/logs" ]; then
+            ( cd "$SRC/logs" && find . -name 'run_*_*.log' -exec cp --parents {} "$DST/logs/" \; ) || true
+          fi
+
+          # The interpreter, the commit and the package versions this image resolved.
+          mkdir -p "$DST/resolved-tree"
+          docker run --rm --network none xgboost-medicao bash -c 'source /home/runner/miniconda3/etc/profile.d/conda.sh; conda activate cpp_test; git rev-parse HEAD; git -C dmlc-core rev-parse HEAD; conda --version; gcc --version | head -n 1; cmake --version | head -n 1; ninja --version; sccache --version' > "$DST/resolved-tree/versions.txt" || true
+          docker run --rm --network none xgboost-medicao conda list --name cpp_test --explicit > "$DST/resolved-tree/conda-explicit.txt" || true
+          docker run --rm --network none xgboost-medicao cat /image-provenance/dpkg.txt > "$DST/resolved-tree/dpkg.txt" || true
+
+          find "$DST" -type f | sort
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-xgboost-${{ github.run_number }}
+          path: ${{ github.workspace }}/artifact/
+          retention-days: 90
