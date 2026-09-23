@@ -283,11 +283,11 @@ if [ -n "$ENERGY_CPUSET" ]; then
   echo "::warning title=CPU set pinned::ENERGY_CPUSET=$ENERGY_CPUSET for run $RUN_NUM (rehearsal only; the campaign applies no CPU limit)"
 fi
 
-echo "run,stage,energy_pkg_j,energy_cores_j,energy_gpu_j,energy_ram_j,wall_time_s,user_time_s,sys_time_s,energy_ram_liquid_raw_j,wall_time_container_s,baseline_rate_pkg_w,baseline_rate_cores_w,baseline_rate_ram_w" \
+echo "run,stage,energy_pkg_j,energy_cores_j,energy_gpu_j,energy_ram_j,wall_time_s,user_time_s,sys_time_s,energy_ram_liquid_raw_j,wall_time_container_s,baseline_rate_pkg_w,baseline_rate_cores_w,baseline_rate_ram_w,cpu_time_cgroup_s" \
   > "$CSV_FILE"
 
 total_pkg=0; total_cores=0; total_gpu=0; total_ram=0; total_ram_raw=0
-total_wall=0; total_user=0; total_sys=0; total_wall_container=0
+total_wall=0; total_user=0; total_sys=0; total_wall_container=0; total_cpu_cgroup=0
 
 # Ceiling reached: no measurement exists, so no CSV row, only the sidecar.
 abort_stage_timeout() {
@@ -430,6 +430,7 @@ measure_stage() {
   set +e
   # The internal network has eth0 and no external route; the image holds every input.
   # fd3 keeps the workload stderr while `time` measures inside the container.
+  # The sccache server compiles as a daemon outside the tree `time` accounts for; the container cgroup counts it.
   /usr/bin/time -f "%e" -o "$TIME_FILE" \
     timeout --foreground -s TERM -k 30 "$stage_timeout" \
     docker run --rm --name "$cname" --privileged --network "$NETWORK_NAME" \
@@ -440,7 +441,7 @@ measure_stage() {
       -v "$BUILD_VOLUME:$BUILD_DIR" \
       -e "STAGE=$stage" \
       "$IMAGE_NAME" \
-      bash -c 'run_stage() { exec 3>&2; TIMEFORMAT="%R %U %S"; { time bash /medicao/commands.sh "$STAGE" 2>&3; } 2>/timing/time.txt; }; '"$carry" \
+      bash -c 'run_stage() { C0=$(grep ^usage_usec /sys/fs/cgroup/cpu.stat | cut -d" " -f2 || echo ""); exec 3>&2; TIMEFORMAT="%R %U %S"; { time bash /medicao/commands.sh "$STAGE" 2>&3; } 2>/timing/time.txt; rc=$?; C1=$(grep ^usage_usec /sys/fs/cgroup/cpu.stat | cut -d" " -f2 || echo ""); echo "$C0 $C1" > /timing/cpu.txt; return $rc; }; '"$carry" \
       2>&1 | tee "$stage_log"
   stage_exit=${PIPESTATUS[0]}
   set -e
@@ -496,6 +497,17 @@ measure_stage() {
   else
     wall_container_t="0.000"; user_t="0.000"; sys_t="0.000"
   fi
+  local cpu_cgroup_t="0.000" c0 c1
+  if [ -f "$timing_dir/cpu.txt" ]; then
+    read -r c0 c1 < "$timing_dir/cpu.txt"
+    if [[ "${c0:-}" =~ ^[0-9]+$ && "${c1:-}" =~ ^[0-9]+$ && "$c1" -ge "$c0" ]]; then
+      cpu_cgroup_t=$(awk "BEGIN {printf \"%.3f\", ($c1 - $c0) / 1e6}")
+    else
+      echo "  cpu.stat of the container cgroup unreadable ('${c0:-}' '${c1:-}') - cpu_time_cgroup_s=0" >&2
+    fi
+  else
+    echo "  cpu.txt missing - cpu_time_cgroup_s=0" >&2
+  fi
   rm -rf "$timing_dir"
 
   local d_pkg d_cores d_gpu d_ram
@@ -524,7 +536,7 @@ measure_stage() {
     echo "  ${dom}: delta=${d}uJ baseline=$(awk "BEGIN {printf \"%.0f\", $t * $wall}")uJ net=$(awk "BEGIN {printf \"%.3f\", ($d - $t * $wall) / 1e6}")J clamped=${j}J"
   done
 
-  echo "$RUN_NUM,$stage,$j_pkg,$j_cores,$j_gpu,$j_ram,$wall,$user_t,$sys_t,$j_ram_raw,$wall_container_t,$taxa_pkg_w,$taxa_cores_w,$taxa_ram_w" >> "$CSV_FILE"
+  echo "$RUN_NUM,$stage,$j_pkg,$j_cores,$j_gpu,$j_ram,$wall,$user_t,$sys_t,$j_ram_raw,$wall_container_t,$taxa_pkg_w,$taxa_cores_w,$taxa_ram_w,$cpu_cgroup_t" >> "$CSV_FILE"
 
   total_pkg=$(awk   "BEGIN {printf \"%.6f\", $total_pkg   + $j_pkg}")
   total_cores=$(awk "BEGIN {printf \"%.6f\", $total_cores + $j_cores}")
@@ -535,8 +547,9 @@ measure_stage() {
   total_user=$(awk  "BEGIN {printf \"%.3f\", $total_user  + $user_t}")
   total_sys=$(awk   "BEGIN {printf \"%.3f\", $total_sys   + $sys_t}")
   total_wall_container=$(awk "BEGIN {printf \"%.3f\", $total_wall_container + $wall_container_t}")
+  total_cpu_cgroup=$(awk "BEGIN {printf \"%.3f\", $total_cpu_cgroup + $cpu_cgroup_t}")
 
-  echo "    pkg: ${j_pkg}J | cores: ${j_cores}J | ram: ${j_ram}J | wall: ${wall}s"
+  echo "    pkg: ${j_pkg}J | cores: ${j_cores}J | ram: ${j_ram}J | wall: ${wall}s | cpu_cgroup: ${cpu_cgroup_t}s"
 }
 # The job's order: the library and testxgboost are compiled, then ctest runs the binary.
 measure_stage build
@@ -548,7 +561,7 @@ else
   echo "::warning title=Artifact check failed::run $RUN_NUM, stage(s) $NONCONFORM_STAGES did not meet the pre-registered criterion; see $ARTIFACT_FILE. CSV rows kept, exit unchanged"
 fi
 
-echo "$RUN_NUM,total,$total_pkg,$total_cores,$total_gpu,$total_ram,$total_wall,$total_user,$total_sys,$total_ram_raw,$total_wall_container,$taxa_pkg_w,$taxa_cores_w,$taxa_ram_w" \
+echo "$RUN_NUM,total,$total_pkg,$total_cores,$total_gpu,$total_ram,$total_wall,$total_user,$total_sys,$total_ram_raw,$total_wall_container,$taxa_pkg_w,$taxa_cores_w,$taxa_ram_w,$total_cpu_cgroup" \
   >> "$CSV_FILE"
 
 echo ""
